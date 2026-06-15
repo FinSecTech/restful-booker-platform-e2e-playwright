@@ -1,0 +1,125 @@
+name: Playwright + Allure Commandline
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Suite to run"
+        required: true
+        default: smoke
+        type: choice
+        options: [smoke, sanity, regression, api, visual, all]
+
+# Prevent concurrent gh-pages corruption from multiple workflow runs
+concurrency:
+  group: allure-gh-pages
+  cancel-in-progress: false
+
+permissions:
+  contents: write # needed for peaceiris push to gh-pages
+  pages: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Java (required by allure-commandline)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps
+
+      - name: Run selected suite
+        env:
+          DOTENV_PRIVATE_KEY_PRODUCTION: ${{ secrets.DOTENV_PRIVATE_KEY_PRODUCTION }}
+          SUITE: ${{ github.event.inputs.suite || 'smoke' }}
+        run: |
+          case "$SUITE" in
+            smoke)     npm run test:smoke ;;
+            sanity)    npm run test:sanity ;;
+            regression)npm run test:regression ;;
+            api)       npm run test:api ;;
+            visual)    npm run test:visual ;;
+            all)       npm test ;;
+            *) echo "Unknown suite: $SUITE"; exit 1 ;;
+          esac
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-artifacts
+          path: |
+            test-results/
+            playwright-report/
+            allure-results/
+          retention-days: 7
+
+      - name: Checkout gh-pages for history
+        if: always()
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: gh-pages-history
+
+      - name: Restore Allure history & generate report
+        if: always()
+        run: |
+          # Restore previous history for trend widgets
+          mkdir -p allure-results/history
+          if [ -d gh-pages-history/history ]; then
+            cp -R gh-pages-history/history/* allure-results/history/ 2>/dev/null || true
+          fi
+          if [ -d gh-pages-history/allure-report/history ]; then
+            cp -R gh-pages-history/allure-report/history/* allure-results/history/ 2>/dev/null || true
+          fi
+
+          # Create executor metadata for Allure trends (by run number)
+          cat > allure-results/executor.json <<EOF
+          {
+            "name": "GitHub Actions",
+            "type": "github",
+            "buildOrder": ${GITHUB_RUN_NUMBER},
+            "buildName": "${GITHUB_WORKFLOW} #${GITHUB_RUN_NUMBER}",
+            "buildUrl": "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}",
+            "reportName": "Allure Report #${GITHUB_RUN_NUMBER}",
+            "reportUrl": "https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
+          }
+          EOF
+
+          # Generate Allure report
+          node ./node_modules/allure-commandline/bin/allure generate allure-results --clean -o allure-report
+
+          # GitHub Pages skips folders starting with _ without .nojekyll
+          touch allure-report/.nojekyll
+
+      - name: Publish Allure report to gh-pages
+        if: always()
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: ./allure-report
+          enable_jekyll: false
+          force_orphan: false # keep history folders
+          commit_message: "Allure Report #${{ github.run_number }} [skip ci]"
